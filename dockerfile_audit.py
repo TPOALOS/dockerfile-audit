@@ -6,15 +6,18 @@ ENV/ARG, curl-pipe-shell installs, remote ADD and similar risks, with a fix for
 each. Standard library only. Exit code 0 = clean, 1 = findings, 2 = error.
 """
 import argparse
+import json
 import os
 import re
 import sys
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 SECRET_NAME = re.compile(r"(?i)(pass(word|wd)?|secret|token|api[_-]?key|private[_-]?key|credential)")
 CURL_PIPE = re.compile(r"(?:curl|wget)\b[^|;&\n]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b")
 SEV = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+IGNORE_LINE = re.compile(r"#\s*dockerfile-audit:\s*ignore(?:\[([^\]]*)\])?")
+IGNORE_FILE = re.compile(r"#\s*dockerfile-audit:\s*ignore-file(?:\[([^\]]*)\])?")
 ARCHIVE = re.compile(r"(?i)\.(tar|tar\.gz|tgz|tar\.bz2|tar\.xz|zip)$")
 
 
@@ -109,6 +112,21 @@ def audit_text(text, has_dockerignore=None):
                     "download, verify a checksum or signature, then run")
             if re.search(r"chmod\s+(?:-R\s+)?0?777\b", args):
                 add("MEDIUM", "chmod-777", no, "world-writable permissions", "grant the minimum needed (e.g. 755 or 644)")
+            if re.search(r"\bpip3?\s+install\b", args) and "--no-cache-dir" not in args and "PIP_NO_CACHE_DIR" not in text:
+                add("LOW", "pip-cache", no, "pip install keeps its download cache in the image layer",
+                    "add --no-cache-dir")
+            if re.search(r"\bapt(?:-get)?\s+install\b", args) and not re.search(r"rm\s+-rf\s+/var/lib/apt/lists", args) \
+                    and "apt-get clean" not in args:
+                add("LOW", "apt-cache", no, "apt lists are left in the layer, enlarging the image",
+                    "end the RUN with `rm -rf /var/lib/apt/lists/*`")
+            if re.search(r"\bapk\s+add\b", args) and "--no-cache" not in args:
+                add("LOW", "apk-cache", no, "apk add without --no-cache keeps the index in the image", "add --no-cache")
+            if re.search(r"\b(?:curl|wget)\b[^|;&]*\s(?:-k|--insecure|--no-check-certificate)\b", args):
+                add("HIGH", "insecure-download", no, "TLS certificate verification is disabled for a download",
+                    "remove -k/--insecure/--no-check-certificate and fix the certificate problem instead")
+            if re.search(r"\bgit\s+clone\b[^&;]*https?://[^/\s:@]+:[^@\s]+@", args):
+                add("HIGH", "secret-in-image", no, "credentials are embedded in a git clone URL (kept in layers)",
+                    "use BuildKit secrets or an SSH mount")
             if re.search(r"\bsudo\b", args):
                 add("LOW", "sudo-in-run", no, "sudo is unnecessary during build and bloats the image", "run as root during build, drop with USER later")
             if re.search(r"apt-get\s+install", args) and "--no-install-recommends" not in args:
@@ -129,13 +147,65 @@ def audit_text(text, has_dockerignore=None):
     return out
 
 
+def apply_ignores(text, findings):
+    lines = text.splitlines()
+    file_rules, file_all = set(), False
+    for l in lines:
+        m = IGNORE_FILE.search(l)
+        if m:
+            if m.group(1):
+                file_rules.update(r.strip() for r in m.group(1).split(","))
+            else:
+                file_all = True
+    kept = []
+    for f in findings:
+        rule, no = f[1], f[2]
+        if file_all or rule in file_rules:
+            continue
+        if no:
+            # the comment may sit on the instruction's first line or on the line directly above it
+            near = [lines[no - 1]] + ([lines[no - 2]] if no >= 2 and lines[no - 2].lstrip().startswith("#") else [])
+            hit = False
+            for l in near:
+                m = IGNORE_LINE.search(l)
+                if m and not IGNORE_FILE.search(l) and (not m.group(1) or rule in [r.strip() for r in m.group(1).split(",")]):
+                    hit = True
+            if hit:
+                continue
+        kept.append(f)
+    return kept
+
+
+def to_sarif(results):
+    level = {"HIGH": "error", "MEDIUM": "warning", "LOW": "note"}
+    rules = sorted({r["rule"] for r in results})
+    return {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {"name": "dockerfile-audit", "version": __version__,
+                                "informationUri": "https://github.com/TPOALOS/dockerfile-audit",
+                                "rules": [{"id": r, "shortDescription": {"text": r}} for r in rules]}},
+            "results": [{
+                "ruleId": r["rule"], "level": level[r["severity"]],
+                "message": {"text": "%s. Fix: %s" % (r["message"], r["fix"])},
+                "locations": [{"physicalLocation": {
+                    "artifactLocation": {"uri": r["file"].replace(os.sep, "/")},
+                    "region": {"startLine": r["line"] or 1}}}],
+            } for r in results],
+        }],
+    }
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Security linter for Dockerfiles (offline).")
     ap.add_argument("files", nargs="*", default=["Dockerfile"])
+    ap.add_argument("--format", choices=("text", "json", "sarif"), default="text")
     ap.add_argument("--min-severity", choices=("LOW", "MEDIUM", "HIGH"), default="LOW")
     ap.add_argument("--version", action="version", version=__version__)
     args = ap.parse_args(argv)
-    limit, count = SEV[args.min_severity], 0
+    limit = SEV[args.min_severity]
+    results = []
     for path in args.files:
         try:
             with open(path, errors="replace") as fh:
@@ -144,11 +214,19 @@ def main(argv=None):
             print("dockerfile-audit: %s" % exc, file=sys.stderr)
             return 2
         di = os.path.isfile(os.path.join(os.path.dirname(os.path.abspath(path)), ".dockerignore"))
-        for sev, rule, no, msg, fix in sorted(audit_text(text, di), key=lambda f: (SEV[f[0]], f[2] or 0)):
-            if SEV[sev] > limit:
-                continue
-            count += 1
-            print("%-6s %-24s %s%s: %s\n         fix: %s" % (sev, rule, path, ":%d" % no if no else "", msg, fix))
+        found = apply_ignores(text, audit_text(text, di))
+        for sev, rule, no, msg, fix in sorted(found, key=lambda f: (SEV[f[0]], f[2] or 0)):
+            if SEV[sev] <= limit:
+                results.append({"severity": sev, "rule": rule, "file": path, "line": no, "message": msg, "fix": fix})
+    count = len(results)
+    if args.format == "json":
+        print(json.dumps(results, indent=2))
+    elif args.format == "sarif":
+        print(json.dumps(to_sarif(results), indent=2))
+    else:
+        for r in results:
+            where = "%s%s" % (r["file"], ":%d" % r["line"] if r["line"] else "")
+            print("%-6s %-24s %s: %s\n         fix: %s" % (r["severity"], r["rule"], where, r["message"], r["fix"]))
     print("dockerfile-audit: %d finding(s)" % count, file=sys.stderr)
     return 1 if count else 0
 

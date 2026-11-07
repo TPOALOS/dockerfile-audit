@@ -9,6 +9,8 @@ One file, standard library only.
 ```bash
 python3 dockerfile_audit.py                      # ./Dockerfile
 python3 dockerfile_audit.py services/api/Dockerfile Dockerfile.dev --min-severity MEDIUM
+python3 dockerfile_audit.py --format json          # or --format sarif for GitHub code scanning
+# or: pip install git+https://github.com/TPOALOS/dockerfile-audit && dockerfile-audit
 ```
 
 Example output:
@@ -27,7 +29,8 @@ MEDIUM unpinned-base-image      Dockerfile:1: ubuntu has no tag, so it implicitl
 | Rule | Severity | What it flags |
 |------|----------|---------------|
 | `runs-as-root` | HIGH | final stage has no `USER`, or the last `USER` is root/0 |
-| `secret-in-image` | HIGH | `ENV`/`ARG` with a secret-looking name (password, token, api key, ...) and a value |
+| `secret-in-image` | HIGH | `ENV`/`ARG` with a secret-looking name (password, token, api key, ...) and a value, or credentials inside a `git clone` URL |
+| `insecure-download` | HIGH | `curl -k`, `--insecure`, `wget --no-check-certificate` |
 | `unpinned-base-image` | MEDIUM | `FROM` without a tag, with `:latest`, and not pinned by digest (stage aliases, `scratch` and `${VAR}` images are skipped) |
 | `curl-pipe-shell` | MEDIUM | `curl ... \| sh` style installs |
 | `remote-add` | MEDIUM | `ADD` from an http(s) URL |
@@ -38,9 +41,24 @@ MEDIUM unpinned-base-image      Dockerfile:1: ubuntu has no tag, so it implicitl
 | `copy-all-no-dockerignore` | LOW | `COPY .` with no `.dockerignore` next to the Dockerfile |
 | `apt-recommends` | LOW | `apt-get install` without `--no-install-recommends` |
 | `sudo-in-run` | LOW | `sudo` during build |
+| `pip-cache` | LOW | `pip install` without `--no-cache-dir` (unless `PIP_NO_CACHE_DIR` is set) |
+| `apt-cache` | LOW | `apt install` that leaves `/var/lib/apt/lists` in the layer |
+| `apk-cache` | LOW | `apk add` without `--no-cache` |
 | `no-healthcheck` | LOW | final stage has no `HEALTHCHECK` |
 
 Exit codes: `0` clean, `1` findings, `2` unreadable file.
+
+### Silencing a finding you accept
+
+```dockerfile
+RUN curl -k https://internal.example/a -o a   # dockerfile-audit: ignore[insecure-download]
+
+# dockerfile-audit: ignore[runs-as-root]
+FROM ubuntu:24.04
+```
+
+The comment can sit on the instruction's line or on the comment line directly above it.
+`# dockerfile-audit: ignore-file[rule,...]` silences rules for the whole file (no list = everything).
 
 ## Limits
 
