@@ -75,3 +75,7 @@ python3 -m unittest -v
 ## License
 
 MIT (c) TPOALOS
+
+---
+
+**More tools by [TPOALOS](https://github.com/TPOALOS):** [reqpin](https://github.com/TPOALOS/reqpin) · [repolint](https://github.com/TPOALOS/repolint) · [gha-audit](https://github.com/TPOALOS/gha-audit) · [all 51 tools](https://tpoalos.github.io)
